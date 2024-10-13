@@ -11,7 +11,6 @@ using namespace std;
 using namespace mju;
 
 int main() {
-    // Person 객체 생성 및 초기화
     Person *p = new Person;
     p->set_name("MJ Kim");
     p->set_id(12345678);
@@ -24,29 +23,25 @@ int main() {
     phone->set_number("02-100-1000");
     phone->set_type(Person::HOME);
 
-    // 직렬화
     const string s = p->SerializeAsString();
     cout << "Length: " << s.length() << endl;
+    
 
-    // UDP 소켓 생성
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         cerr << "Socket creation failed" << endl;
         return 1;
     }
 
-    // 서버 주소 설정
     struct sockaddr_in serverAddr;
     memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(10001); // 서버 포트
-    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1"); // 서버 IP
+    serverAddr.sin_port = htons(10001); 
+    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1"); 
 
-    // 데이터 전송
     int numBytes = sendto(sock, s.c_str(), s.length(), 0, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
     cout << "Sent: " << numBytes << " bytes" << endl;
 
-    // 데이터 수신
     char buf[65536];
     memset(buf, 0, sizeof(buf));
     socklen_t addrLen = sizeof(serverAddr);
@@ -56,7 +51,6 @@ int main() {
     } else {
         cout << "Received: " << numBytes << " bytes" << endl;
 
-        // 수신된 데이터를 역직렬화
         Person *p2 = new Person;
         if (p2->ParseFromString(string(buf, numBytes))) {
             cout << "Name: " << p2->name() << endl;
@@ -71,7 +65,6 @@ int main() {
             delete p2;
     }
 
-    // 소켓 종료
     close(sock);
     delete p;
 
