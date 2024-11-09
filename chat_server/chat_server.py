@@ -30,6 +30,11 @@ def broadcast_message(message, sender_sock, room_id):
             }
             send_json_message(client.sock, system_message)
 
+def broadcast_proto_message(message, sender_sock, room_id):
+    for client in clients:
+        if client.sock != sender_sock and client.room_id == room_id:
+            send_proto_message(client.sock, message)
+
 def notify_room_members(room_id, message, exclude_sock=None):
     for room in rooms:
         if room.id == room_id:
@@ -53,6 +58,24 @@ def handle_name(client, command_json):
     if client.room_id != -1:
         notify_room_members(client.room_id, f"이름이 {new_nickname}으로 변경되었습니다.", client.sock)
         return
+    
+def handle_rooms(client,command_json):
+    rooms_message = {
+        'type': 'SCRoomsResult',
+        'rooms': []
+    }
+    if not rooms:
+        rooms_message['rooms'] = []  
+    else:
+        for room in rooms:
+            room_info = {
+                'roomId': room.id,
+                'title': room.title,
+                'members': [member.nickname for member in room.members]
+            }
+            rooms_message['rooms'].append(room_info)
+
+    send_json_message(client.sock, rooms_message)    
 
 def handle_create_room(client, command_json):
     if client.room_id != -1:
@@ -74,24 +97,6 @@ def handle_create_room(client, command_json):
          'text': success_message
                     }
     send_json_message(client.sock, system_message)
-
-def handle_rooms(client,command_json):
-    rooms_message = {
-        'type': 'SCRoomsResult',
-        'rooms': []
-    }
-    if not rooms:
-        rooms_message['rooms'] = []  
-    else:
-        for room in rooms:
-            room_info = {
-                'roomId': room.id,
-                'title': room.title,
-                'members': [member.nickname for member in room.members]
-            }
-            rooms_message['rooms'].append(room_info)
-
-    send_json_message(client.sock, rooms_message)
 
 def handle_join_room(client, command_json):
     room_id = command_json['roomId']
@@ -165,6 +170,10 @@ def handle_shutdown(client):
 
     print("모든 클라이언트에게 종료 메시지를 보냈습니다.")
 
+def send_json_message(sock, message):
+    serialized = json.dumps(message).encode('utf-8') 
+    length_prefix = len(serialized).to_bytes(2, byteorder='big')  
+    sock.sendall(length_prefix + serialized) 
 
 # 핸들러 맵
 message_handlers = {
@@ -177,24 +186,25 @@ message_handlers = {
 }
 
 def handle_protobuf_name(client, cs_name):
-    print('handle_proto_name')
-    new_nickname = cs_name.name
-    print('cs_name.name',cs_name.name)
-    client.nickname = new_nickname
-    system_message = f"이름이 {new_nickname}으로 변경되었습니다.\n"
-    send_proto_message(client,system_message)
+        print('handle_proto_name')
+        new_nickname = cs_name.name
+        print('cs_name.name',cs_name.name)
+        if cs_name.name:
+            client.nickname = new_nickname
+            system_message = f"이름이 {new_nickname}으로 변경되었습니다.\n"
+            send_proto_message(client,system_message)
 
-    # if client.room_id != -1:
-    #     broadcast_message(f"{new_nickname}의 이름이 변경되었습니다.\n", client.sock, client.room_id)
+        if client.room_id != -1:
+            broadcast_proto_message(f"이름이 {new_nickname}으로 변경되었습니다.\n", client.sock, client.room_id)
 
 def handle_protobuf_rooms(client, cs_rooms):
     rooms_message = pb.SCRoomsResult()
 
-    for room in rooms:
+    for room in rooms:  
         room_info = rooms_message.rooms.add() 
         room_info.roomId = room.id
         room_info.title = room.title
-        room_info.members.extend([member.nickname for member in room.members])
+        room_info.members.extend([member.nickname for member in room.members])  
 
     serialized_rooms_message = rooms_message.SerializeToString()
 
@@ -206,17 +216,18 @@ def handle_protobuf_rooms(client, cs_rooms):
     length_prefix_type = len(serialized_type_message).to_bytes(2, byteorder='big')
     length_prefix_rooms = len(serialized_rooms_message).to_bytes(2, byteorder='big')
 
+
     client.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_rooms + serialized_rooms_message)
 
-
 def handle_protobuf_create_room(client, cs_create_room):
-    room_title = cs_create_room.title
-    new_room = Room(len(rooms) + 1, room_title)
-    new_room.members.append(client)
-    rooms.append(new_room)
-    client.room_id = new_room.id
-    success_message = f"[시스템 메시지] 방제[{room_title}] 방에 입장했습니다.\n"
-    client.sock.sendall(success_message.encode('utf-8'))
+    if cs_create_room.title:
+        room_title = cs_create_room.title
+        new_room = Room(len(rooms) + 1, room_title)
+        new_room.members.append(client)
+        rooms.append(new_room)
+        client.room_id = new_room.id
+        system_message = f"방제[{room_title}] 방에 입장했습니다.\n"
+        send_proto_message(client,system_message)
 
 def handle_protobuf_join_room(client, cs_join_room):
     room_id = cs_join_room.roomId
@@ -224,20 +235,6 @@ def handle_protobuf_join_room(client, cs_join_room):
 
 def handle_protobuf_leave_room(client):
     handle_leave_room(client)  # JSON 핸들러와 동일하게 처리
-
-
-protobuf_handlers = {
-    pb.Type.MessageType.CS_NAME: handle_protobuf_name,
-    pb.Type.MessageType.CS_ROOMS: handle_protobuf_rooms,
-    pb.Type.MessageType.CS_CREATE_ROOM: handle_protobuf_create_room,
-    pb.Type.MessageType.CS_JOIN_ROOM: handle_protobuf_join_room,
-    pb.Type.MessageType.CS_LEAVE_ROOM: handle_protobuf_leave_room,
-}
-
-def send_json_message(sock, message):
-    serialized = json.dumps(message).encode('utf-8') 
-    length_prefix = len(serialized).to_bytes(2, byteorder='big')  
-    sock.sendall(length_prefix + serialized) 
 
 def send_proto_message(client, message):
     system_message = pb.SCSystemMessage()
@@ -252,9 +249,16 @@ def send_proto_message(client, message):
 
     length_prefix_type = len(serialized_type_message).to_bytes(2, byteorder='big')
     length_prefix_system = len(serialized_system_message).to_bytes(2, byteorder='big')
-
+    print('?',length_prefix_type + serialized_type_message + length_prefix_system + serialized_system_message)
     client.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_system + serialized_system_message)
 
+protobuf_handlers = {
+    pb.Type.MessageType.CS_NAME: handle_protobuf_name,
+    pb.Type.MessageType.CS_ROOMS: handle_protobuf_rooms,
+    pb.Type.MessageType.CS_CREATE_ROOM: handle_protobuf_create_room,
+    pb.Type.MessageType.CS_JOIN_ROOM: handle_protobuf_join_room,
+    pb.Type.MessageType.CS_LEAVE_ROOM: handle_protobuf_leave_room,
+}
 
 def process_message(client, buffer):
     try:
@@ -278,29 +282,25 @@ def process_message(client, buffer):
         except json.JSONDecodeError:
             # JSON 파싱 실패 시 Protobuf 처리
             try:
-
                 type_message = pb.Type()
                 type_message.ParseFromString(message_data)  
                 print('type_message.type',type_message.type)
                 # Protobuf 메시지 타입 핸들링
                 if type_message.type in protobuf_handlers:
+                    protobuf_message = None
                     if type_message.type == pb.Type.MessageType.CS_NAME:
-                        cs_name = pb.CSName()
-                        cs_name.ParseFromString(message_data) 
-                        #print(cs_name.ParseFromString(message_data))
-                        protobuf_handlers[type_message.type](client, cs_name)
-
+                        protobuf_message = pb.CSName()
                     elif type_message.type == pb.Type.MessageType.CS_CREATE_ROOM:
-                        cs_create_room = pb.CSCreateRoom()
-                        cs_create_room.ParseFromString(message_data)  
-                        protobuf_handlers[type_message.type](client, cs_create_room)
-
+                        protobuf_message = pb.CSCreateRoom()
                     elif type_message.type == pb.Type.MessageType.CS_JOIN_ROOM:
-                        cs_join_room = pb.CSJoinRoom()
-                        cs_join_room.ParseFromString(message_data)  
-                        protobuf_handlers[type_message.type](client, cs_join_room)
-
+                        protobuf_message = pb.CSJoinRoom()
                     elif type_message.type == pb.Type.MessageType.CS_LEAVE_ROOM:
+                        protobuf_message = None  
+
+                    if protobuf_message:
+                        protobuf_message.ParseFromString(message_data)
+                        protobuf_handlers[type_message.type](client, protobuf_message)
+                    else:
                         protobuf_handlers[type_message.type](client)
 
             except Exception as e:
@@ -308,8 +308,6 @@ def process_message(client, buffer):
 
     except Exception as e:
         print(f"Error processing message: {e}")
-
-
 
 def handle_client(client):
 
@@ -320,17 +318,24 @@ def handle_client(client):
     # send_json_message(client.sock, welcome_message)
     
     print('handle_client')
+    buffer=b''
     while not quit_flag:
         print('quit_flag')
         try:
-            buffer = client.sock.recv(BUFFER_SIZE)
-            print('client',client.sock)
-            print('buffer')
-            if not buffer:
+            data=client.sock.recv(BUFFER_SIZE)
+            print('len buffer',len(buffer))
+
+            if not data:
                 print(f"Client {client.nickname} disconnected.")
                 break  
+            
+            buffer+=data
+            print('buffer',buffer)
+            print('bufferlen',len(buffer))
 
-            process_message(client, buffer)
+            if(len(buffer)>10):
+                process_message(client, buffer)
+                buffer=b''
 
         except Exception as e:
             print(f"Error handling client {client.nickname}: {e}")
@@ -340,7 +345,6 @@ def handle_client(client):
         clients.remove(client)
     client.sock.close()
     print(f"Client disconnected: {client.nickname}")
-
 
 def main():
     passive_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
