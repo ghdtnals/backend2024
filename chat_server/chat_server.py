@@ -14,6 +14,8 @@ class Client:
         self.sock = sock
         self.nickname = f"({address[0]}, {address[1]})"
         self.room_id = -1
+        self.num=0
+        self.ptype=None
 
 class Room:
     def __init__(self, room_id, title):
@@ -31,9 +33,10 @@ def broadcast_message(message, sender_sock, room_id):
             send_json_message(client.sock, system_message)
 
 def broadcast_proto_message(message, sender_sock, room_id):
+    print('broadcast_proto')
     for client in clients:
         if client.sock != sender_sock and client.room_id == room_id:
-            send_proto_message(client.sock, message)
+            send_proto_message(client, message)
 
 def notify_room_members(room_id, message, exclude_sock=None):
     for room in rooms:
@@ -45,6 +48,13 @@ def notify_room_members(room_id, message, exclude_sock=None):
                     'text': message
                     }
                     send_json_message(member.sock, system_message)
+
+def notify_room_pmembers(room_id, message, exclude_sock=None):
+    for room in rooms:
+        if room.id == room_id:
+            for member in room.members:
+                if member.sock != exclude_sock:
+                    send_proto_message(member, message)
 
 def handle_name(client, command_json):
     new_nickname = command_json['name']
@@ -195,9 +205,9 @@ def handle_protobuf_name(client, cs_name):
             send_proto_message(client,system_message)
 
         if client.room_id != -1:
-            broadcast_proto_message(f"이름이 {new_nickname}으로 변경되었습니다.\n", client.sock, client.room_id)
+            notify_room_pmembers(client.room_id, f"이름이 {new_nickname}으로 변경되었습니다.\n",client.sock)
 
-def handle_protobuf_rooms(client, cs_rooms):
+def handle_protobuf_rooms(client):
     rooms_message = pb.SCRoomsResult()
 
     for room in rooms:  
@@ -220,6 +230,11 @@ def handle_protobuf_rooms(client, cs_rooms):
     client.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_rooms + serialized_rooms_message)
 
 def handle_protobuf_create_room(client, cs_create_room):
+    if client.room_id != -1:
+        error_message = "대화 방에 있을 때는 방을 개설할 수 없습니다.\n"
+        send_proto_message(client,error_message)
+        return
+    
     if cs_create_room.title:
         room_title = cs_create_room.title
         new_room = Room(len(rooms) + 1, room_title)
@@ -231,10 +246,55 @@ def handle_protobuf_create_room(client, cs_create_room):
 
 def handle_protobuf_join_room(client, cs_join_room):
     room_id = cs_join_room.roomId
-    handle_join_room(client, {'roomId': room_id})
+
+    if client.room_id!=-1:
+        error_message = "대화 방에 있을 때는 다른 방에 들어갈 수 없습니다.\n"
+        send_proto_message(client,error_message)
+        return
+    
+    room = next((r for r in rooms if r.id == room_id), None)
+    
+    if room is None:  
+        error_message = "대화방이 존재하지 않습니다.\n"
+        send_proto_message(client,error_message)
+        
+    else:    
+        room.members.append(client)
+        client.room_id = room_id
+
+        success_message = f"방제[{room.title}] 방에 입장했습니다.\n"
+        send_proto_message(client,success_message)
+    
+        notify_room_pmembers(client.room_id, f"[{client.nickname}]님이 입장했습니다.\n",client.sock)        
 
 def handle_protobuf_leave_room(client):
-    handle_leave_room(client)  # JSON 핸들러와 동일하게 처리
+    if client.room_id == -1:
+        error_message = "현재 대화방에 들어가 있지 않습니다.\n"
+        send_proto_message(client,error_message)
+
+    else:
+        room_id = client.room_id
+        notify_room_pmembers(room_id, f"[{client.nickname}]님이 퇴장했습니다.\n", client.sock)
+        
+        room = next((r for r in rooms if r.id == room_id), None)
+        if room:
+            room.members = [member for member in room.members if member.nickname != client.nickname]
+        
+        leave_message = f"방제[{rooms[room_id - 1].title}] 대화 방에서 퇴장했습니다.\n"
+        send_proto_message(client,leave_message)
+        client.room_id = -1
+
+def handle_protobuf_chat(client, cs_chat):
+    # 클라이언트가 채팅 메시지를 보냈을 때 처리하는 함수
+    if client.room_id == -1:
+        # 대화 방에 없을 경우 시스템 메시지 전송
+        error_message = "현재 대화방에 들어가 있지 않습니다.\n"
+        send_proto_message(client, error_message)
+    else:
+        # 대화 방에 있는 경우, 메시지를 다른 클라이언트에게 전송
+        message_text = cs_chat.text
+        print('message_text',message_text)
+        broadcast_proto_message(f"[{client.nickname}]님이: {message_text}", client.sock, client.room_id)
 
 def send_proto_message(client, message):
     system_message = pb.SCSystemMessage()
@@ -249,7 +309,6 @@ def send_proto_message(client, message):
 
     length_prefix_type = len(serialized_type_message).to_bytes(2, byteorder='big')
     length_prefix_system = len(serialized_system_message).to_bytes(2, byteorder='big')
-    print('?',length_prefix_type + serialized_type_message + length_prefix_system + serialized_system_message)
     client.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_system + serialized_system_message)
 
 protobuf_handlers = {
@@ -258,6 +317,7 @@ protobuf_handlers = {
     pb.Type.MessageType.CS_CREATE_ROOM: handle_protobuf_create_room,
     pb.Type.MessageType.CS_JOIN_ROOM: handle_protobuf_join_room,
     pb.Type.MessageType.CS_LEAVE_ROOM: handle_protobuf_leave_room,
+    pb.Type.MessageType.CS_CHAT: handle_protobuf_chat
 }
 
 def process_message(client, buffer):
@@ -282,26 +342,38 @@ def process_message(client, buffer):
         except json.JSONDecodeError:
             # JSON 파싱 실패 시 Protobuf 처리
             try:
-                type_message = pb.Type()
-                type_message.ParseFromString(message_data)  
-                print('type_message.type',type_message.type)
+                if(client.num%2==0):
+                    type_message = pb.Type()
+                    type_message.ParseFromString(message_data)
+                    client.ptype=type_message.type
+                    client.num+=1
+                    print('num',client.num)
+                    
                 # Protobuf 메시지 타입 핸들링
-                if type_message.type in protobuf_handlers:
+                elif client.ptype in protobuf_handlers:
+                    print('client.ptype',client.ptype)
                     protobuf_message = None
-                    if type_message.type == pb.Type.MessageType.CS_NAME:
+                    if client.ptype == pb.Type.MessageType.CS_NAME:
                         protobuf_message = pb.CSName()
-                    elif type_message.type == pb.Type.MessageType.CS_CREATE_ROOM:
+                    elif client.ptype == pb.Type.MessageType.CS_CREATE_ROOM:
                         protobuf_message = pb.CSCreateRoom()
-                    elif type_message.type == pb.Type.MessageType.CS_JOIN_ROOM:
+                    elif client.ptype == pb.Type.MessageType.CS_JOIN_ROOM:
                         protobuf_message = pb.CSJoinRoom()
-                    elif type_message.type == pb.Type.MessageType.CS_LEAVE_ROOM:
-                        protobuf_message = None  
+                    elif client.ptype == pb.Type.MessageType.CS_CHAT:
+                        protobuf_message=pb.CSChat()
+                    elif client.ptype == pb.Type.MessageType.CS_LEAVE_ROOM:
+                        protobuf_message = None 
+                    elif client.ptype == pb.Type.MessageType.CS_ROOMS:
+                        protobuf_message= None 
 
                     if protobuf_message:
+                        print('protobuf_message',protobuf_message)
                         protobuf_message.ParseFromString(message_data)
-                        protobuf_handlers[type_message.type](client, protobuf_message)
+                        protobuf_handlers[client.ptype](client, protobuf_message)
+                        client.num = 0
                     else:
-                        protobuf_handlers[type_message.type](client)
+                        protobuf_handlers[client.ptype](client)
+                        client.num=0
 
             except Exception as e:
                 print(f"Error processing Protobuf message: {e}")
@@ -322,20 +394,12 @@ def handle_client(client):
     while not quit_flag:
         print('quit_flag')
         try:
-            data=client.sock.recv(BUFFER_SIZE)
-            print('len buffer',len(buffer))
-
-            if not data:
+            buffer=client.sock.recv(BUFFER_SIZE)
+            print('buffer',buffer)
+            if not buffer:
                 print(f"Client {client.nickname} disconnected.")
                 break  
-            
-            buffer+=data
-            print('buffer',buffer)
-            print('bufferlen',len(buffer))
-
-            if(len(buffer)>10):
-                process_message(client, buffer)
-                buffer=b''
+            process_message(client,buffer)
 
         except Exception as e:
             print(f"Error handling client {client.nickname}: {e}")
