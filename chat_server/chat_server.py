@@ -3,6 +3,7 @@ import threading
 import json
 import message_pb2 as pb
 import select
+import queue
 
 clients = []
 rooms = []
@@ -16,6 +17,39 @@ class Client:
         self.room_id = -1
         self.num=0
         self.ptype=None
+
+
+        self.message_queue = queue.Queue()  # 클라이언트 메시지 큐
+        self.condition = threading.Condition()  # Condition Variable
+        self.lock = threading.Lock()  # Mutex 
+        self.thread = threading.Thread(target=self.process_messages) # 메시지 처리 쓰레드
+        self.thread.start() 
+        
+    def process_messages(self):
+        while True:
+            with self.condition: 
+                while self.message_queue.empty(): 
+                    self.condition.wait()  
+
+                message = self.message_queue.get()  
+                if message is None:  
+                    break
+
+            with self.lock:  
+                if isinstance(message, tuple):
+                    func, msg = message  
+                    func(self, msg)  
+                else:
+                    self.handle_message(message)
+
+    def add_message(self, message):
+        with self.lock:  
+            self.message_queue.put(message) 
+            with self.condition: 
+                self.condition.notify()
+
+    def handle_message(self, message):
+        print(f"Processing message from {self.nickname}: {message}")
 
 class Room:
     def __init__(self, room_id, title):
@@ -36,7 +70,8 @@ def broadcast_proto_message(message, sender_sock, room_id):
     print('broadcast_proto')
     for client in clients:
         if client.sock != sender_sock and client.room_id == room_id:
-            send_proto_message(client, message)
+            #send_proto_message(client, message)
+             client.add_message((send_proto_message, message))  # 함수와 메시지를 튜플로 추가
 
 def notify_room_members(room_id, message, exclude_sock=None):
     for room in rooms:
@@ -54,7 +89,8 @@ def notify_room_pmembers(room_id, message, exclude_sock=None):
         if room.id == room_id:
             for member in room.members:
                 if member.sock != exclude_sock:
-                    send_proto_message(member, message)
+                    #send_proto_message(member, message)
+                    member.add_message((send_proto_message, message))
 
 def handle_name(client, command_json):
     new_nickname = command_json['name']
@@ -173,11 +209,6 @@ def handle_shutdown(client):
         'text': shutdown_message
     }
 
-    #with clients_lock:  
-        # for c in clients:
-        #     send_json_message(c.sock, system_message)
-        #     c.sock.close()  
-
     print("모든 클라이언트에게 종료 메시지를 보냈습니다.")
 
 def send_json_message(sock, message):
@@ -203,6 +234,7 @@ def handle_protobuf_name(client, cs_name):
             client.nickname = new_nickname
             system_message = f"이름이 {new_nickname}으로 변경되었습니다.\n"
             send_proto_message(client,system_message)
+            
 
         if client.room_id != -1:
             notify_room_pmembers(client.room_id, f"이름이 {new_nickname}으로 변경되었습니다.\n",client.sock)
@@ -296,6 +328,27 @@ def handle_protobuf_chat(client, cs_chat):
         print('message_text',message_text)
         broadcast_proto_message(f"[{client.nickname}]님이: {message_text}", client.sock, client.room_id)
 
+def handle_protobuf_shutdown(client):
+    global quit_flag
+    quit_flag = True
+
+    shutdown_message = "서버가 종료됩니다.\n"
+    
+    # 모든 클라이언트에게 종료 메시지 전송
+    for c in clients:
+        c.add_message(shutdown_message) 
+        c.add_message(None)  
+
+    print("모든 클라이언트에게 종료 메시지를 보냈습니다.")
+
+    # 모든 클라이언트의 스레드가 종료될 때까지 대기
+    for c in clients:
+        c.thread.join()  # 각 클라이언트의 메시지 처리 스레드 종료 대기
+
+    print("모든 클라이언트의 스레드가 종료되었습니다.")
+   
+
+
 def send_proto_message(client, message):
     system_message = pb.SCSystemMessage()
     system_message.text = message
@@ -317,8 +370,11 @@ protobuf_handlers = {
     pb.Type.MessageType.CS_CREATE_ROOM: handle_protobuf_create_room,
     pb.Type.MessageType.CS_JOIN_ROOM: handle_protobuf_join_room,
     pb.Type.MessageType.CS_LEAVE_ROOM: handle_protobuf_leave_room,
-    pb.Type.MessageType.CS_CHAT: handle_protobuf_chat
+    pb.Type.MessageType.CS_CHAT: handle_protobuf_chat,
+    pb.Type.MessageType. CS_SHUTDOWN: handle_protobuf_shutdown
+
 }
+
 
 def process_message(client, buffer):
     try:
@@ -365,6 +421,8 @@ def process_message(client, buffer):
                         protobuf_message = None 
                     elif client.ptype == pb.Type.MessageType.CS_ROOMS:
                         protobuf_message= None 
+                    elif client.ptype==pb.Type.MessageType.CS_SHUTDOWN:
+                        protobuf_message=None
 
                     if protobuf_message:
                         print('protobuf_message',protobuf_message)
@@ -382,12 +440,6 @@ def process_message(client, buffer):
         print(f"Error processing message: {e}")
 
 def handle_client(client):
-
-    # welcome_message = {
-    #     'type': 'SCSystemMessage',
-    #     'text': 'You are connected!\n'
-    # }
-    # send_json_message(client.sock, welcome_message)
     
     print('handle_client')
     buffer=b''
@@ -434,9 +486,9 @@ def main():
                 #print(new_client.sock,new_client.nickname)
                 clients.append(new_client)
                 #sockets_list.append(client_sock)  
-
                 client_thread = threading.Thread(target=handle_client, args=(new_client,))
                 client_thread.start()
+
 
             else:
                 # 클라이언트로부터 메시지 수신
@@ -456,20 +508,6 @@ def main():
 
     passive_sock.close()
     print("서버가 종료되었습니다.")
-
-    # print("Waiting for connections...")
-
-    # while True:
-    #     client_sock, address = passive_sock.accept()
-    #     print(f"Accepted connection from {address}")
-    #     new_client = Client(client_sock, address)
-        
-    #     client_thread = threading.Thread(target=handle_client, args=(new_client,))
-    #     client_thread.start()  
-        
-    #     clients.append(new_client)
-
-    # passive_sock.close()
 
 if __name__ == "__main__":
     main()
