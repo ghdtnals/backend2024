@@ -3,30 +3,41 @@ import threading
 import json
 import message_pb2 as pb
 import select
-import queue
 from models import (Client, Room)
 clients = []
 rooms = []
 quit_flag = False
 BUFFER_SIZE = 65536
 
-def broadcast_message(message, sender_sock, room_id):
-    for client in clients:
-        if client.sock != sender_sock and client.room_id == room_id:
-            system_message = {
-            'type': 'SCSystemMessage',
-            'text': message
-            }
-            send_json_message(client.sock, system_message)
+def send_json_message(sock, message):
+    serialized = json.dumps(message).encode('utf-8') 
+    length_prefix = len(serialized).to_bytes(2, byteorder='big')  
+    sock.sendall(length_prefix + serialized) 
 
-def broadcast_proto_message(message, sender_sock, room_id):
-    print('broadcast_proto')
-    for client in clients:
-        if client.sock != sender_sock and client.room_id == room_id:
-            #send_proto_message(client, message)
-             client.add_message((send_proto_message, message))  # 함수와 메시지를 튜플로 추가
+def send_proto_message(client, message):
+    '''
+    시스템 메세지를 Protobuf 형식으로 Serialize하고 클라이언트에게 보낸다.
+
+    :param client: Client 객체
+    :param message: 보낼 메세지
+    '''
+    system_message = pb.SCSystemMessage()
+    system_message.text = message
+
+    serialized_system_message = system_message.SerializeToString()
+
+    type_message = pb.Type()
+    type_message.type = pb.Type.MessageType.SC_SYSTEM_MESSAGE
+
+    serialized_type_message = type_message.SerializeToString()
+
+    length_prefix_type = len(serialized_type_message).to_bytes(2, byteorder='big')
+    length_prefix_system = len(serialized_system_message).to_bytes(2, byteorder='big')
+
+    client.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_system + serialized_system_message)
 
 def notify_room_members(room_id, message, exclude_sock=None):
+    
     for room in rooms:
         if room.id == room_id:
             for member in room.members:
@@ -38,12 +49,20 @@ def notify_room_members(room_id, message, exclude_sock=None):
                     send_json_message(member.sock, system_message)
 
 def notify_room_pmembers(room_id, message, exclude_sock=None):
+    '''
+    클라이언트가 속한 방의 모든 클라이언트에게 Protobuf 형식으로 시스템 메세지를 보낸다.
+
+    :param room_id: Client의 room_id
+    :param message: 보낼 시스템 메세지
+    :param exclude_sock: Client의 sock
+    '''
     for room in rooms:
         if room.id == room_id:
             for member in room.members:
                 if member.sock != exclude_sock:
                     #send_proto_message(member, message)
                     member.add_message((send_proto_message, message))
+
 
 def handle_name(client, command_json):
     new_nickname = command_json['name']
@@ -152,7 +171,26 @@ def handle_leave_room(client,command_json):
         send_json_message(client.sock, system_message)
         client.room_id = -1
 
-def handle_shutdown(client):
+def handle_chat(client, command_json):
+    if client.room_id == -1:
+        error_message = {
+        'type': 'SCSystemMessage',
+        'text': f"현재 대화방에 들어가 있지 않습니다.\n"
+    }
+        send_json_message(client.sock, error_message)
+
+    else:
+        for c in clients:
+            if c.sock != client.sock and c.room_id == client.room_id:
+                message_text = command_json['text']
+                chat_message = {
+                'type': 'SCChat',
+                'text': message_text,
+                "member":client.nickname
+                            }
+                send_json_message(c.sock, chat_message)
+
+def handle_shutdown(client,command_json):
     global quit_flag
     quit_flag = True
 
@@ -162,14 +200,21 @@ def handle_shutdown(client):
         'text': shutdown_message
     }
 
+    for c in clients:
+        send_json_message(c.sock,system_message)  
     print("모든 클라이언트에게 종료 메시지를 보냈습니다.")
 
-def send_json_message(sock, message):
-    serialized = json.dumps(message).encode('utf-8') 
-    length_prefix = len(serialized).to_bytes(2, byteorder='big')  
-    sock.sendall(length_prefix + serialized) 
+    for c in clients:
+        print('Closing client socket:', c.nickname)
+        c.sock.close()     
 
-# 핸들러 맵
+    for c in clients:
+        if c.thread.is_alive():  
+            print('Joining thread:', c.nickname)
+            c.thread.join() 
+
+    return
+
 message_handlers = {
     'CSName': handle_name,
     'CSRooms': handle_rooms,
@@ -177,17 +222,18 @@ message_handlers = {
     'CSJoinRoom': handle_join_room,
     'CSLeaveRoom': handle_leave_room,
     'CSShutdown': handle_shutdown,
+    'CSChat':handle_chat
+    
 }
 
 def handle_protobuf_name(client, cs_name):
-        print('handle_proto_name')
-        new_nickname = cs_name.name
-        print('cs_name.name',cs_name.name)
-        if cs_name.name:
-            client.nickname = new_nickname
-            system_message = f"이름이 {new_nickname}으로 변경되었습니다.\n"
-            send_proto_message(client,system_message)
-            
+    print('handle_proto_name')
+    new_nickname = cs_name.name
+
+    if cs_name.name:
+        client.nickname = new_nickname
+        system_message = f"이름이 {new_nickname}으로 변경되었습니다.\n"
+        send_proto_message(client,system_message)
 
         if client.room_id != -1:
             notify_room_pmembers(client.room_id, f"이름이 {new_nickname}으로 변경되었습니다.\n",client.sock)
@@ -211,7 +257,6 @@ def handle_protobuf_rooms(client):
     length_prefix_type = len(serialized_type_message).to_bytes(2, byteorder='big')
     length_prefix_rooms = len(serialized_rooms_message).to_bytes(2, byteorder='big')
 
-
     client.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_rooms + serialized_rooms_message)
 
 def handle_protobuf_create_room(client, cs_create_room):
@@ -229,7 +274,7 @@ def handle_protobuf_create_room(client, cs_create_room):
         system_message = f"방제[{room_title}] 방에 입장했습니다.\n"
         send_proto_message(client,system_message)
 
-def handle_protobuf_join_room(client, cs_join_room):
+def handle_protobuf_join_room(client, cs_join_room):   
     room_id = cs_join_room.roomId
 
     if client.room_id!=-1:
@@ -270,16 +315,30 @@ def handle_protobuf_leave_room(client):
         client.room_id = -1
 
 def handle_protobuf_chat(client, cs_chat):
-    # 클라이언트가 채팅 메시지를 보냈을 때 처리하는 함수
     if client.room_id == -1:
-        # 대화 방에 없을 경우 시스템 메시지 전송
         error_message = "현재 대화방에 들어가 있지 않습니다.\n"
         send_proto_message(client, error_message)
+
     else:
-        # 대화 방에 있는 경우, 메시지를 다른 클라이언트에게 전송
-        message_text = cs_chat.text
-        print('message_text',message_text)
-        broadcast_proto_message(f"[{client.nickname}]님이: {message_text}", client.sock, client.room_id)
+        for c in clients:
+            if c.sock != client.sock and c.room_id == client.room_id:
+                message_text = cs_chat.text
+
+                chat_message = pb.SCChat()
+                chat_message.member = client.nickname  
+                chat_message.text = message_text  
+
+                serialized_chat_message = chat_message.SerializeToString()
+
+                type_message = pb.Type()
+                type_message.type = pb.Type.MessageType.SC_CHAT
+
+                serialized_type_message = type_message.SerializeToString()
+
+                length_prefix_type = len(serialized_type_message).to_bytes(2, byteorder='big')
+                length_prefix_chat = len(serialized_chat_message).to_bytes(2, byteorder='big')
+
+                c.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_chat + serialized_chat_message)
 
 def handle_protobuf_shutdown(client):
     global quit_flag
@@ -287,35 +346,21 @@ def handle_protobuf_shutdown(client):
 
     shutdown_message = "서버가 종료됩니다.\n"
     
-    # 모든 클라이언트에게 종료 메시지 전송
     for c in clients:
         c.add_message(shutdown_message) 
         c.add_message(None)  
-
     print("모든 클라이언트에게 종료 메시지를 보냈습니다.")
 
-    # 모든 클라이언트의 스레드가 종료될 때까지 대기
     for c in clients:
-        c.thread.join()  # 각 클라이언트의 메시지 처리 스레드 종료 대기
+        print
+        print('Closing client socket:', c.nickname)
+        c.sock.close()  
 
+    for c in clients:
+        c.thread.join() 
     print("모든 클라이언트의 스레드가 종료되었습니다.")
-   
 
-
-def send_proto_message(client, message):
-    system_message = pb.SCSystemMessage()
-    system_message.text = message
-
-    serialized_system_message = system_message.SerializeToString()
-
-    type_message = pb.Type()
-    type_message.type = pb.Type.MessageType.SC_SYSTEM_MESSAGE
-
-    serialized_type_message = type_message.SerializeToString()
-
-    length_prefix_type = len(serialized_type_message).to_bytes(2, byteorder='big')
-    length_prefix_system = len(serialized_system_message).to_bytes(2, byteorder='big')
-    client.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_system + serialized_system_message)
+    return
 
 protobuf_handlers = {
     pb.Type.MessageType.CS_NAME: handle_protobuf_name,
@@ -325,9 +370,7 @@ protobuf_handlers = {
     pb.Type.MessageType.CS_LEAVE_ROOM: handle_protobuf_leave_room,
     pb.Type.MessageType.CS_CHAT: handle_protobuf_chat,
     pb.Type.MessageType. CS_SHUTDOWN: handle_protobuf_shutdown
-
 }
-
 
 def process_message(client, buffer):
     try:
@@ -410,11 +453,12 @@ def handle_client(client):
             print(f"Error handling client {client.nickname}: {e}")
             break 
 
-    if client in clients:  
+    if client in clients: 
         clients.remove(client)
-    client.sock.close()
-    print(f"Client disconnected: {client.nickname}")
+        print(f"Client {client.nickname} has been removed from clients list.")
 
+    print(f"Client disconnected: {client.nickname}")
+    
 def main():
     passive_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     passive_sock.bind(('127.0.0.1', 10133))
@@ -459,8 +503,9 @@ def main():
 
                     process_message(client, buffer)
 
-    passive_sock.close()
     print("서버가 종료되었습니다.")
+    passive_sock.close()
+  
 
 if __name__ == "__main__":
     main()
