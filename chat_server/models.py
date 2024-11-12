@@ -8,13 +8,14 @@ class Client:
         self.room_id = -1
         self.num=0
         self.ptype=None
-
+        
 
         self.message_queue = queue.Queue()  # 클라이언트 메시지 큐
         self.condition = threading.Condition()  # Condition Variable
         self.lock = threading.Lock()  # Mutex 
         self.thread = threading.Thread(target=self.process_messages) # 메시지 처리 쓰레드
         self.thread.start() 
+        self.should_exit=False
         
     def process_messages(self):
         while True:
