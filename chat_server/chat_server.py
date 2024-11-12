@@ -4,10 +4,16 @@ import json
 import message_pb2 as pb
 import select
 from models import (Client, Room)
+from concurrent.futures import ThreadPoolExecutor
+import argparse
+import queue
+
 clients = []
 rooms = []
 quit_flag = False
 BUFFER_SIZE = 65536
+message_queue=queue.Queue()
+
 
 def send_json_message(sock, message):
     serialized = json.dumps(message).encode('utf-8') 
@@ -139,12 +145,14 @@ def handle_join_room(client, command_json):
 
     room.members.append(client)
     client.room_id = room_id
+
     success_message = {
         'type': 'SCSystemMessage',
         'text': f"방제[{room.title}] 방에 입장했습니다.\n"
     }
     send_json_message(client.sock, success_message)
-    notify_room_members(client.room_id, f"[{client.nickname}]님이 입장했습니다.\n")
+
+    notify_room_members(client.room_id, f"[{client.nickname}]님이 입장했습니다.\n",client.sock)
 
 
 def handle_leave_room(client,command_json):
@@ -191,9 +199,6 @@ def handle_chat(client, command_json):
                 send_json_message(c.sock, chat_message)
 
 def handle_shutdown(client,command_json):
-    global quit_flag
-    quit_flag = True
-
     shutdown_message = "서버가 종료됩니다.\n"
     system_message = {
         'type': 'SCSystemMessage',
@@ -202,19 +207,17 @@ def handle_shutdown(client,command_json):
 
     for c in clients:
         send_json_message(c.sock,system_message)  
-    print("모든 클라이언트에게 종료 메시지를 보냈습니다.")
+    print("모든 클라이언트에게 종료 메시지를 보냈습니다.")       
 
     for c in clients:
-        print('Closing client socket:', c.nickname)
-        c.sock.close()     
+        c.stop()   
+    print("모든 클라이언트의 스레드가 종료되었고 소켓이 닫혔습니다.")
 
-    for c in clients:
-        if c.thread.is_alive():  
-            print('Joining thread:', c.nickname)
-            c.thread.join() 
-
-    return
-
+    global passive_sock
+    if passive_sock:
+        passive_sock.close()
+        print("서버 소켓이 닫혔습니다.")
+        
 message_handlers = {
     'CSName': handle_name,
     'CSRooms': handle_rooms,
@@ -227,7 +230,7 @@ message_handlers = {
 }
 
 def handle_protobuf_name(client, cs_name):
-    print('handle_proto_name')
+    print('handle_proto_name',cs_name.name)
     new_nickname = cs_name.name
 
     if cs_name.name:
@@ -341,9 +344,6 @@ def handle_protobuf_chat(client, cs_chat):
                 c.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_chat + serialized_chat_message)
 
 def handle_protobuf_shutdown(client):
-    global quit_flag
-    quit_flag = True
-
     shutdown_message = "서버가 종료됩니다.\n"
     
     for c in clients:
@@ -352,15 +352,12 @@ def handle_protobuf_shutdown(client):
     print("모든 클라이언트에게 종료 메시지를 보냈습니다.")
 
     for c in clients:
-        print
         print('Closing client socket:', c.nickname)
         c.sock.close()  
 
     for c in clients:
         c.thread.join() 
     print("모든 클라이언트의 스레드가 종료되었습니다.")
-
-    return
 
 protobuf_handlers = {
     pb.Type.MessageType.CS_NAME: handle_protobuf_name,
@@ -436,11 +433,10 @@ def process_message(client, buffer):
         print(f"Error processing message: {e}")
 
 def handle_client(client):
-    
     print('handle_client')
     buffer=b''
-    while not quit_flag:
-        print('quit_flag')
+    # while not client.should_exit:
+    while True:
         try:
             buffer=client.sock.recv(BUFFER_SIZE)
             print('buffer',buffer)
@@ -453,60 +449,60 @@ def handle_client(client):
             print(f"Error handling client {client.nickname}: {e}")
             break 
 
-    if client in clients: 
-        clients.remove(client)
-        print(f"Client {client.nickname} has been removed from clients list.")
-
-    print(f"Client disconnected: {client.nickname}")
-    
-def main():
+def main(max_workers):
+    global quit_flag, passive_sock
+    print('main')
     passive_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     passive_sock.bind(('127.0.0.1', 10133))
     passive_sock.listen(10)
 
     print("Waiting for connections...")
 
-    sockets_list = [passive_sock]
+    client_sockets=[]
 
-    while not quit_flag:
-        read_sockets, _, _ = select.select(sockets_list, [], [])
-
-        for notified_sock in read_sockets:
-            print('read_sockets',read_sockets)
-            if notified_sock == passive_sock:
-                print('notified_sock',notified_sock)
-                # 새로운 클라이언트 연결 수락
-                client_sock, address = passive_sock.accept()
-                print(f"Accepted connection from {address}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while not quit_flag:
+            read_sockets, _, _ = select.select([passive_sock]+client_sockets, [], [])
             
-                new_client = Client(client_sock, address)
-                #print(new_client.sock,new_client.nickname)
-                clients.append(new_client)
-                #sockets_list.append(client_sock)  
-                client_thread = threading.Thread(target=handle_client, args=(new_client,))
-                client_thread.start()
+            print('read_sockets',read_sockets)
+            
+            if read_sockets:
+                for notified_sock in read_sockets:
+                    if notified_sock == passive_sock:
+                        print('notified_sock==passive_sock',notified_sock)
+                        client_sock, address = passive_sock.accept()
+                        print(f"Accepted connection from {address}")
 
+                        client_sockets.append(client_sock)
+                        new_client = Client(client_sock, address)
+                        clients.append(new_client) 
 
-            else:
-                # 클라이언트로부터 메시지 수신
-                client = next((c for c in clients if c.sock == notified_sock), None)
+                        executor.submit(handle_client, new_client)
 
-                if client:
-                    buffer = notified_sock.recv(BUFFER_SIZE)
-                    print('buffer2',buffer)
-                    if not buffer:
-                        clients.remove(client)
-                        sockets_list.remove(notified_sock)
-                        notified_sock.close()
-                        print(f"Client disconnected: {client.nickname}")
-                        continue
+                    else:
+                        print('notified_sock!=passive_sock',notified_sock)
 
-                    process_message(client, buffer)
-
-    print("서버가 종료되었습니다.")
+                        buffer = notified_sock.recv(BUFFER_SIZE)
+                        if not buffer:
+                            client_to_remove = next((c for c in clients if c.sock == notified_sock), None)
+                            if client_to_remove:
+                                clients.remove(client_to_remove)
+                            client_sockets.remove(notified_sock)
+                            print(f"Connection closed by {client_to_remove.nickname}")
+                            notified_sock.close()
+                        else:
+                            client = next((c for c in clients if c.sock == notified_sock), None)
+                            if client:
+                                print(f"Received data from {client.nickname}")
+                                process_message(client, buffer)
+                            
+    print('passive_sock close')
     passive_sock.close()
   
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='서버의 워커 쓰레드 수를 설정합니다.')
+    parser.add_argument('--workers', type=int, default=5, help='워커 쓰레드 수 (기본값: 5)')
+    args = parser.parse_args()
+
+    main(args.workers)
 
