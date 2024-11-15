@@ -1,24 +1,32 @@
 import socket
-import threading
 import json
 import message_pb2 as pb
 import select
 from models import (Client, Room)
-from concurrent.futures import ThreadPoolExecutor
 import argparse
 import queue
+import threading
+import sys
 
 clients = []
+client_queue=queue.Queue()
+lock = threading.Lock()  
+condition = threading.Condition(lock)  
 rooms = []
 quit_flag = False
 BUFFER_SIZE = 65536
-message_queue=queue.Queue()
+type=None
 
+def send_json_message(client, message):
+    '''
+    시스템 메세지를 JSON 형식으로 Serialize하고 클라이언트에게 보낸다.
 
-def send_json_message(sock, message):
+    :param client: Client 객체
+    :param message: 보낼 메세지
+    '''
     serialized = json.dumps(message).encode('utf-8') 
     length_prefix = len(serialized).to_bytes(2, byteorder='big')  
-    sock.sendall(length_prefix + serialized) 
+    client.sock.sendall(length_prefix + serialized) 
 
 def send_proto_message(client, message):
     '''
@@ -43,7 +51,13 @@ def send_proto_message(client, message):
     client.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_system + serialized_system_message)
 
 def notify_room_members(room_id, message, exclude_sock=None):
-    
+    '''
+    클라이언트가 속한 방의 모든 클라이언트에게 JSON 형식으로 시스템 메세지를 보낸다.
+
+    :param room_id: Client의 room_id
+    :param message: 보낼 시스템 메세지
+    :param exclude_sock: Client의 sock
+    '''   
     for room in rooms:
         if room.id == room_id:
             for member in room.members:
@@ -52,7 +66,7 @@ def notify_room_members(room_id, message, exclude_sock=None):
                     'type': 'SCSystemMessage',
                     'text': message
                     }
-                    send_json_message(member.sock, system_message)
+                    send_json_message(member, system_message)
 
 def notify_room_pmembers(room_id, message, exclude_sock=None):
     '''
@@ -66,9 +80,7 @@ def notify_room_pmembers(room_id, message, exclude_sock=None):
         if room.id == room_id:
             for member in room.members:
                 if member.sock != exclude_sock:
-                    #send_proto_message(member, message)
-                    member.add_message((send_proto_message, message))
-
+                    send_proto_message(member,message)
 
 def handle_name(client, command_json):
     new_nickname = command_json['name']
@@ -77,11 +89,12 @@ def handle_name(client, command_json):
         'type': 'SCSystemMessage',
         'text': f"이름이 {new_nickname}으로 변경되었습니다.\n"
     }
-    send_json_message(client.sock, system_message)
+    send_json_message(client, system_message)
 
     if client.room_id != -1:
         notify_room_members(client.room_id, f"이름이 {new_nickname}으로 변경되었습니다.", client.sock)
-        return
+    
+    return
     
 def handle_rooms(client,command_json):
     rooms_message = {
@@ -89,7 +102,8 @@ def handle_rooms(client,command_json):
         'rooms': []
     }
     if not rooms:
-        rooms_message['rooms'] = []  
+        rooms_message['rooms'] = [] 
+
     else:
         for room in rooms:
             room_info = {
@@ -99,7 +113,7 @@ def handle_rooms(client,command_json):
             }
             rooms_message['rooms'].append(room_info)
 
-    send_json_message(client.sock, rooms_message)    
+    send_json_message(client, rooms_message)   
 
 def handle_create_room(client, command_json):
     if client.room_id != -1:
@@ -107,20 +121,20 @@ def handle_create_room(client, command_json):
         'type': 'SCSystemMessage',
         'text': f"대화 방에 있을 때는 방을 개설할 수 없습니다.\n"
     }
-        send_json_message(client.sock, error_message)
-        return
-        
-    room_title = command_json['title']
-    new_room = Room(len(rooms) + 1, room_title)
-    new_room.members.append(client)
-    rooms.append(new_room)
-    client.room_id = new_room.id
-    success_message = f"방제 [{room_title}] 방에 입장했습니다.\n"
-    system_message = {
-         'type': 'SCSystemMessage',
-         'text': success_message
-                    }
-    send_json_message(client.sock, system_message)
+        send_json_message(client, error_message)
+
+    else:        
+        room_title = command_json['title']
+        new_room = Room(len(rooms) + 1, room_title)
+        new_room.members.append(client)
+        rooms.append(new_room)
+        client.room_id = new_room.id
+        success_message = f"방제 [{room_title}] 방에 입장했습니다.\n"
+        system_message = {
+            'type': 'SCSystemMessage',
+            'text': success_message
+                        }
+        send_json_message(client, system_message)
 
 def handle_join_room(client, command_json):
     room_id = command_json['roomId']
@@ -130,29 +144,29 @@ def handle_join_room(client, command_json):
             'type': 'SCSystemMessage',
             'text': "대화 방에 있을 때는 다른 방에 들어갈 수 없습니다.\n"
         }
-        send_json_message(client.sock, error_message)
-        return  
+        send_json_message(client, error_message)
+        
+    else:
+        room = next((r for r in rooms if r.id == room_id), None)
+        
+        if room is None:  
+            error_message = {
+                'type': 'SCSystemMessage',
+                'text': "대화방이 존재하지 않습니다.\n"
+            }
+            send_json_message(client, error_message)
+            
+        else:
+            room.members.append(client)
+            client.room_id = room_id
 
-    room = next((r for r in rooms if r.id == room_id), None)
-    
-    if room is None:  
-        error_message = {
-            'type': 'SCSystemMessage',
-            'text': "대화방이 존재하지 않습니다.\n"
-        }
-        send_json_message(client.sock, error_message)
-        return 
+            success_message = {
+                'type': 'SCSystemMessage',
+                'text': f"방제[{room.title}] 방에 입장했습니다.\n"
+            }
+            send_json_message(client, success_message)
 
-    room.members.append(client)
-    client.room_id = room_id
-
-    success_message = {
-        'type': 'SCSystemMessage',
-        'text': f"방제[{room.title}] 방에 입장했습니다.\n"
-    }
-    send_json_message(client.sock, success_message)
-
-    notify_room_members(client.room_id, f"[{client.nickname}]님이 입장했습니다.\n",client.sock)
+            notify_room_members(client.room_id, f"[{client.nickname}]님이 입장했습니다.\n",client.sock)
 
 
 def handle_leave_room(client,command_json):
@@ -161,7 +175,7 @@ def handle_leave_room(client,command_json):
         'type': 'SCSystemMessage',
         'text': f"현재 대화방에 들어가 있지 않습니다.\n"
     }
-        send_json_message(client.sock, error_message)
+        send_json_message(client, error_message)
 
     else:
         room_id = client.room_id
@@ -176,48 +190,34 @@ def handle_leave_room(client,command_json):
             'type': 'SCSystemMessage',
             'text': leave_message
                         }
-        send_json_message(client.sock, system_message)
+        send_json_message(client, system_message)
         client.room_id = -1
 
 def handle_chat(client, command_json):
+    print('handle_chat')
     if client.room_id == -1:
         error_message = {
         'type': 'SCSystemMessage',
         'text': f"현재 대화방에 들어가 있지 않습니다.\n"
     }
-        send_json_message(client.sock, error_message)
+        send_json_message(client, error_message)
 
     else:
-        for c in clients:
-            if c.sock != client.sock and c.room_id == client.room_id:
-                message_text = command_json['text']
-                chat_message = {
-                'type': 'SCChat',
-                'text': message_text,
-                "member":client.nickname
-                            }
-                send_json_message(c.sock, chat_message)
+            for c in clients:
+                print('c',c)
+                if c.sock != client.sock and c.room_id == client.room_id:
+                    message_text = command_json['text']
+                    chat_message = {
+                    'type': 'SCChat',
+                    'text': message_text,
+                    "member":client.nickname
+                                    }
+                    send_json_message(c, chat_message)
 
 def handle_shutdown(client,command_json):
-    shutdown_message = "서버가 종료됩니다.\n"
-    system_message = {
-        'type': 'SCSystemMessage',
-        'text': shutdown_message
-    }
+    global quit_flag
+    quit_flag=True
 
-    for c in clients:
-        send_json_message(c.sock,system_message)  
-    print("모든 클라이언트에게 종료 메시지를 보냈습니다.")       
-
-    for c in clients:
-        c.stop()   
-    print("모든 클라이언트의 스레드가 종료되었고 소켓이 닫혔습니다.")
-
-    global passive_sock
-    if passive_sock:
-        passive_sock.close()
-        print("서버 소켓이 닫혔습니다.")
-        
 message_handlers = {
     'CSName': handle_name,
     'CSRooms': handle_rooms,
@@ -318,6 +318,7 @@ def handle_protobuf_leave_room(client):
         client.room_id = -1
 
 def handle_protobuf_chat(client, cs_chat):
+    print('protobuf_chat')
     if client.room_id == -1:
         error_message = "현재 대화방에 들어가 있지 않습니다.\n"
         send_proto_message(client, error_message)
@@ -344,20 +345,8 @@ def handle_protobuf_chat(client, cs_chat):
                 c.sock.sendall(length_prefix_type + serialized_type_message + length_prefix_chat + serialized_chat_message)
 
 def handle_protobuf_shutdown(client):
-    shutdown_message = "서버가 종료됩니다.\n"
-    
-    for c in clients:
-        c.add_message(shutdown_message) 
-        c.add_message(None)  
-    print("모든 클라이언트에게 종료 메시지를 보냈습니다.")
-
-    for c in clients:
-        print('Closing client socket:', c.nickname)
-        c.sock.close()  
-
-    for c in clients:
-        c.thread.join() 
-    print("모든 클라이언트의 스레드가 종료되었습니다.")
+    global quit_flag
+    quit_flag=True
 
 protobuf_handlers = {
     pb.Type.MessageType.CS_NAME: handle_protobuf_name,
@@ -370,6 +359,8 @@ protobuf_handlers = {
 }
 
 def process_message(client, buffer):
+    print('process_message')
+    global type
     try:
         if len(buffer) < 2:
             return
@@ -381,15 +372,14 @@ def process_message(client, buffer):
         message_data = buffer[2:current_message_len + 2]
         
         # JSON 메시지 처리
-        try:
+        if(type=='json'):
             command_json = json.loads(message_data.decode('utf-8'))
             message_type = command_json['type']
 
             if message_type in message_handlers:
                 message_handlers[message_type](client, command_json)
 
-        except json.JSONDecodeError:
-            # JSON 파싱 실패 시 Protobuf 처리
+        else:
             try:
                 if(client.num%2==0):
                     type_message = pb.Type()
@@ -432,77 +422,92 @@ def process_message(client, buffer):
     except Exception as e:
         print(f"Error processing message: {e}")
 
-def handle_client(client):
+    return
+
+def handle_client(): 
     print('handle_client')
+    global quit_flag
     buffer=b''
-    # while not client.should_exit:
-    while True:
-        try:
+
+    while not quit_flag:
+        with condition:
+            while client_queue.empty():
+                condition.wait()  
+            client = client_queue.get() 
+            print('client',client) 
+            client_queue.task_done()  
+
+        while not quit_flag:
             buffer=client.sock.recv(BUFFER_SIZE)
-            print('buffer',buffer)
+            print('buffer',client.nickname,buffer)
             if not buffer:
-                print(f"Client {client.nickname} disconnected.")
-                break  
+                print(f"NO BUFFER")
+                break
             process_message(client,buffer)
 
-        except Exception as e:
-            print(f"Error handling client {client.nickname}: {e}")
-            break 
+    for client in clients:
+        print(f"Closing connection for {client.nickname}")
+        client.sock.close()  
+    clients.clear()   
 
-def main(max_workers):
-    global quit_flag, passive_sock
-    print('main')
+def server_loop(passive_sock):
+    global quit_flag
+    print("Waiting for connections...")
+    
+    while not quit_flag:
+        read_sockets, _, _ = select.select([passive_sock], [], [])
+        print('read_sockets', read_sockets)
+
+        if read_sockets:
+            client_sock, address = passive_sock.accept()
+            print(f"Accepted connection from {address}")
+
+            new_client = Client(client_sock, address)
+            print('new_client',new_client)
+            clients.append(new_client)
+
+            with lock:
+                    client_queue.put(new_client)  
+                    condition.notify()  
+
+def main(max_workers,format):
+    global type
+    type=format
+    print('Server starting')
+    print('Max workers:', max_workers)
+    print('type',type)
+
     passive_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     passive_sock.bind(('127.0.0.1', 10133))
     passive_sock.listen(10)
+    
+    threads = []
+    for _ in range(max_workers):
+        thread = threading.Thread(target=server_loop, args=(passive_sock,))
+        thread.start()
+        threads.append(thread)
+        print('threads',thread)
 
-    print("Waiting for connections...")
+    for _ in range(max_workers):
+        thread = threading.Thread(target=handle_client, args=())
+        thread.start()
+        threads.append(thread)
+        print('threads',thread)
 
-    client_sockets=[]
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        while not quit_flag:
-            read_sockets, _, _ = select.select([passive_sock]+client_sockets, [], [])
+    for thread in threads:
+        if thread.is_alive():  
+            thread.join()
             
-            print('read_sockets',read_sockets)
-            
-            if read_sockets:
-                for notified_sock in read_sockets:
-                    if notified_sock == passive_sock:
-                        print('notified_sock==passive_sock',notified_sock)
-                        client_sock, address = passive_sock.accept()
-                        print(f"Accepted connection from {address}")
-
-                        client_sockets.append(client_sock)
-                        new_client = Client(client_sock, address)
-                        clients.append(new_client) 
-
-                        executor.submit(handle_client, new_client)
-
-                    else:
-                        print('notified_sock!=passive_sock',notified_sock)
-
-                        buffer = notified_sock.recv(BUFFER_SIZE)
-                        if not buffer:
-                            client_to_remove = next((c for c in clients if c.sock == notified_sock), None)
-                            if client_to_remove:
-                                clients.remove(client_to_remove)
-                            client_sockets.remove(notified_sock)
-                            print(f"Connection closed by {client_to_remove.nickname}")
-                            notified_sock.close()
-                        else:
-                            client = next((c for c in clients if c.sock == notified_sock), None)
-                            if client:
-                                print(f"Received data from {client.nickname}")
-                                process_message(client, buffer)
-                            
-    print('passive_sock close')
+    print('passive_sock closed')
     passive_sock.close()
-  
+    sys.exit(0)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='서버의 워커 쓰레드 수를 설정합니다.')
     parser.add_argument('--workers', type=int, default=5, help='워커 쓰레드 수 (기본값: 5)')
+    parser.add_argument('--format', choices=['json', 'protobuf'], default='json', help='데이터 포맷 (기본값: json)')
+
     args = parser.parse_args()
 
-    main(args.workers)
+    main(args.workers,args.format)
 
